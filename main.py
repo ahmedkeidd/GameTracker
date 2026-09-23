@@ -5,12 +5,15 @@ from dotenv import load_dotenv
 from supabase import create_client
 import sqlite3
 import os
+import requests
 
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+RAWG_API_KEY = os.getenv("RAWG_API_KEY")
 
 security = HTTPBearer()
 
@@ -35,13 +38,58 @@ def init_db():
         CREATE TABLE IF NOT EXISTS games (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'not_yet'
+            status TEXT NOT NULL DEFAULT 'not_yet',
+            cover_url TEXT,
+            genre TEXT,
+            rating REAL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rawg_cache (
+            title TEXT PRIMARY KEY,
+            cover_url TEXT,
+            genre TEXT,
+            rating REAL
         )
     """)
     conn.commit()
     conn.close()
 
 init_db()
+
+def get_game_metadata(title: str):
+    conn = get_db()
+    cached = conn.execute("SELECT * FROM rawg_cache WHERE title = ?", (title,)).fetchone()
+    if cached:
+        conn.close()
+        print(f"CACHE HIT: {title}")
+        return dict(cached)
+
+    print(f"FETCHING FROM RAWG: {title}")
+    response = requests.get(
+        "https://api.rawg.io/api/games",
+        params={"key": RAWG_API_KEY, "search": title, "page_size": 1},
+        timeout=10
+    )
+    data = response.json()
+
+    if not data.get("results"):
+        conn.close()
+        return {"cover_url": None, "genre": None, "rating": None}
+
+    result = data["results"][0]
+    cover_url = result.get("background_image")
+    genre = result["genres"][0]["name"] if result.get("genres") else None
+    rating = result.get("rating")
+
+    conn.execute(
+        "INSERT INTO rawg_cache (title, cover_url, genre, rating) VALUES (?, ?, ?, ?)",
+        (title, cover_url, genre, rating)
+    )
+    conn.commit()
+    conn.close()
+
+    return {"cover_url": cover_url, "genre": genre, "rating": rating}
 
 app = FastAPI()
 
@@ -86,7 +134,7 @@ def login(data: dict):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Auth provider error: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid login credentials")
 
 @app.get("/games")
 def get_games(user=Depends(verify_token)):
@@ -99,8 +147,14 @@ def get_games(user=Depends(verify_token)):
 def create_game(game: GameCreate, user=Depends(verify_token)):
     if not game.title.strip():
         raise HTTPException(status_code=400, detail="Title is required")
+
+    metadata = get_game_metadata(game.title)
+
     conn = get_db()
-    cursor = conn.execute("INSERT INTO games (title, status) VALUES (?, ?)", (game.title, "not_yet"))
+    cursor = conn.execute(
+        "INSERT INTO games (title, status, cover_url, genre, rating) VALUES (?, ?, ?, ?, ?)",
+        (game.title, "not_yet", metadata["cover_url"], metadata["genre"], metadata["rating"])
+    )
     conn.commit()
     new_game = conn.execute("SELECT * FROM games WHERE id = ?", (cursor.lastrowid,)).fetchone()
     conn.close()
